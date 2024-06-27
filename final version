@@ -1,0 +1,118 @@
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import MiniBatchKMeans  # Import MiniBatchKMeans for incremental learning
+import joblib  # Import joblib for model serialization
+import os
+import gc
+import traceback
+
+# variety of input and out folder, Input is for source files, output is for processed files, model_file is where the learned and learning PKL file is stored 
+input_folder = "/run/user/1000/gvfs/smb-share:server=192.168.101.61,share=uni-ai/PCAP/Group Process/"
+output_folder = "/run/user/1000/gvfs/smb-share:server=192.168.101.61,share=uni-ai/PCAP/Process testing/"
+model_file = os.path.join(output_folder, "kmeans_model.pkl")  # File to save/load the model
+log_file = os.path.join(output_folder, "error_log.txt")
+
+# Load the MiniBatchKMeans model, if it exists
+if os.path.exists(model_file):
+    print("Load MiniBatchKMeans model!")
+    kmeans = joblib.load(model_file)
+else:
+    kmeans = None
+
+chunk_size = 10000  # Number of rows per chunk, this uses 10,000 uses around 60gb of ram
+
+# Determine the complete set of columns after encoding
+sample_file = [f for f in os.listdir(input_folder) if f.endswith(".csv")][0]
+sample_chunk = pd.read_csv(os.path.join(input_folder, sample_file), sep=",", header=0, nrows=chunk_size)
+sample_encoded = pd.get_dummies(sample_chunk, columns=['ip.src', 'ip.dst', 'ip.proto', 'tcp.srcport', 'tcp.dstport', 'tcp.flags'])
+complete_columns = sample_encoded.drop(columns=['frame.time']).columns
+
+# Iterate over each file in the folder
+for filename in os.listdir(input_folder):
+    if filename.endswith(".csv"):
+        try:
+            # Construct the full path of the CSV file
+            input_csv = os.path.join(input_folder, filename)
+            output_csv = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}-output.csv")
+            anomaly_csv = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}-output-anomaly.csv")
+
+            print(f"Processing file: {input_csv}")
+
+            # Process the CSV file in chunks
+            chunks = []
+            anomaly_chunks = []
+
+            for chunk in pd.read_csv(input_csv, sep=",", header=0, chunksize=chunk_size):
+                print("Processing a chunk")
+
+                print("Encode data frame!")
+                # Encoding for categorical variables, verify fields listed below.
+                chunk_encoded = pd.get_dummies(chunk, columns=['ip.src', 'ip.dst', 'ip.proto', 'tcp.srcport', 'tcp.dstport', 'tcp.flags'])
+
+                # Drop time
+                chunk_encoded = chunk_encoded.drop(columns=['frame.time'])
+
+                # Align chunk with the complete set of columns
+                chunk_encoded = chunk_encoded.reindex(columns=complete_columns, fill_value=0)
+
+                print("Scale data frame!")
+                scaler = StandardScaler()
+                chunk_scaled = scaler.fit_transform(chunk_encoded)
+                chunk_scaled = pd.DataFrame(chunk_scaled, columns=chunk_encoded.columns)
+
+                # Train or/and update the MiniBatchKMeans model
+                if kmeans is None:
+                    print("Train MiniBatchKMeans model!")
+                    num_cluster = 3
+                    kmeans = MiniBatchKMeans(n_clusters=num_cluster, random_state=42)
+                    kmeans.fit(chunk_scaled)
+                else:
+                    print("Update MiniBatchKMeans model!")
+                    kmeans.partial_fit(chunk_scaled)
+
+                # Predict clusters for the data
+                cluster_labels = kmeans.predict(chunk_scaled)
+                chunk['cluster'] = cluster_labels
+
+                print("Detecting anomalies")
+
+                cluster_centers = kmeans.cluster_centers_
+                distances = np.linalg.norm(chunk_scaled - cluster_centers[cluster_labels], axis=1)
+
+                # Determine a threshold for anomaly detection (e.g., 2 standard deviations)
+                threshold = np.std(distances) * 2
+
+                # Mark points as anomalies if they are beyond the threshold
+                chunk['is_anomaly'] = distances > threshold
+                anomalies = chunk[chunk['is_anomaly']]
+
+                # Collect processed chunks
+                chunks.append(chunk)
+                anomaly_chunks.append(anomalies)
+
+                # Force garbage collection to free memory
+                gc.collect()
+
+            # Concatenate all processed chunks
+            final_df = pd.concat(chunks)
+            anomaly_df = pd.concat(anomaly_chunks)
+
+            print("Output processed data")
+            final_df.to_csv(output_csv, index=False)  # Set index=False to not write row numbers
+            anomaly_df.to_csv(anomaly_csv, index=False)  # Set index=False to not write row numbers
+
+            # Save the updated model
+            joblib.dump(kmeans, model_file)
+
+            print("File processing completed!")
+        except Exception as e:
+            error_message = f"Failed processing file {filename}: {str(e)}\n{traceback.format_exc()}"
+            print(error_message)
+            with open(log_file, 'a') as log:
+                log.write(error_message)
+#task has finished and nothing has crashed or ran out of memory
+print("All files processed!")
+
+
